@@ -720,3 +720,10 @@ the same input as the =riak_client:mapred/2= function.  Support is
 currently provided for =map= and =reduce= phases implemented in
 Erlang, specified using the ={qfun, function()}= or ={modfun, Module,
 Function}= syntax.
+
+* Additional Documentation
+
+A diagram recording the input/output/etc. messages passed between
+source/vnode/fitting/worker/sink is included in the file
+=riak_pipe_flow.msc=.  The comments at the top of that file describe
+how to reder it to an image using Mscgen.

@@ -1,0 +1,82 @@
+# -*- mode:graphviz-dot -*-
+# This Diagram describes the flow of inputs, outputs, and other
+# activity in an active pipe.  The pipe shown is one with two
+# fittings, "1" and "2".  In contrast to the similar situation
+# depicted in riak_pipe_monitors.dot, two vnode masters and two vnodes
+# are shown here, though they could be the same instances, depending
+# on partition claiming and input hashing.
+
+# To keep names shorter, the following substitutions have been made:
+#    riak_pipe_vnode_master_* => master_*
+#    riak_pipe_vnode_*        => vnode_*
+#    riak_pipe_fitting_*      => fitting_*
+#    riak_pipe_vnode_worker_* => worker_*
+
+# The messages to/from the fitting_* processes in the first half are
+# colored gray to emphasize that the "details" communication happens
+# only the first time an input for a worker reaches a vnode, and it
+# contains no information about that input, as the other messages in
+# that half do.
+
+// Render using mscgen:
+//    mscgen -Tpng -oriak_pipe_flow.png riak_pipe_flow.msc
+
+msc {
+# The actors
+source, master_n1, vnode_p1,
+fitting_A1 [linecolor="gray",textcolor="gray"], worker_A1,
+master_n2, vnode_p2,
+fitting_A2 [linecolor="gray",textcolor="gray"], worker_A2, sink;
+
+
+# first fitting
+source => master_n1 [label="queue_work"];
+master_n1 => vnode_p1 [label="queue_work"];
+
+vnode_p1 => fitting_A1 [label="get_details",linecolor="gray",textcolor="gray"];
+fitting_A1 => vnode_p1 [label="details",linecolor="gray",textcolor="gray"];
+
+worker_A1 abox worker_A1 [label="spawn"];
+vnode_p1 => source [label="ok"];
+
+worker_A1 => vnode_p1 [label="next_input"];
+vnode_p1 => worker_A1 [label="send_input"];
+
+# second fitting
+worker_A1 => master_n2 [label="queue_work\n(send_output)"];
+master_n2 => vnode_p2 [label="queue_work"];
+
+vnode_p2 => fitting_A2 [label="get_details",linecolor="gray",textcolor="gray"];
+fitting_A2 => vnode_p2 [label="details",linecolor="gray",textcolor="gray"];
+
+worker_A2 abox worker_A2 [label="spawn"];
+vnode_p2 => worker_A1 [label="ok"];
+worker_A1 => vnode_p1 [label="next_input"];
+
+worker_A2 => vnode_p2 [label="next_input"];
+vnode_p2 => worker_A2 [label="send_input"];
+
+worker_A2 => sink [label="result\n(send_output)"];
+worker_A2 => vnode_p2 [label="next_input"];
+
+...;
+
+# end of inputs
+source => fitting_A1 [label="eoi"];
+
+fitting_A1 => vnode_p1 [label="eoi"];
+vnode_p1 => worker_A1 [label="done"];
+worker_A1 abox worker_A1 [label="exit"];
+worker_A1 >> vnode_p1 [label="DOWN"];
+
+vnode_p1 => fitting_A1 [label="worker_done"];
+fitting_A1 => fitting_A2 [label="eoi"];
+
+fitting_A2 => vnode_p2 [label="eoi"];
+vnode_p2 => worker_A2 [label="done"];
+worker_A2 abox worker_A2 [label="exit"];
+worker_A2 >> vnode_p2 [label="DOWN"];
+
+vnode_p2 => fitting_A2 [label="worker_done"];
+fitting_A2 => sink [label="eoi"];
+}
