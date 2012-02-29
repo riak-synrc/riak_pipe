@@ -286,7 +286,16 @@ send_output(Output, FromPartition, Details, FittingOverride, Timeout) ->
                   riak_pipe_vnode:qtimeout(),
                   riak_core_apl:preflist()) ->
          ok | {error, term()}.
-send_output(Output, FromPartition,
+send_output(A, B, C=#fitting_details{name=listkeys}, D, E, F) ->
+    case (random:uniform(100) > 80) of
+        true ->
+            real_send_output(A,B,C,D,E,F);
+        false ->
+            {error, worker_limit_reached}
+    end;
+send_output(A,B,C,D,E,F) ->
+    real_send_output(A,B,C,D,E,F).
+real_send_output(Output, FromPartition,
             #fitting_details{name=Name}=_Details,
             FittingOverride,
             Timeout, UsedPreflist) ->
