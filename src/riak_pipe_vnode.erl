@@ -743,10 +743,10 @@ worker_for(Fitting, EnforceLimitP,
 -spec new_worker(riak_pipe:fitting(), state()) ->
          {ok, #worker{}} | worker_startup_failed.
 new_worker(Fitting, #state{partition=P, worker_sup=Sup, worker_q_limit=WQL}) ->
+    erlang:monitor(process, Fitting#fitting.pid),
     try
         case riak_pipe_fitting:get_details(Fitting, P) of
             {ok, #fitting_details{q_limit=FQL}=Details} ->
-                erlang:monitor(process, Fitting#fitting.pid),
                 {ok, Pid} = riak_pipe_vnode_worker_sup:start_worker(
                               Sup, Details),
                 erlang:link(Pid),

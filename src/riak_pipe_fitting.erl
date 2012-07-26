@@ -99,7 +99,8 @@ eoi(#fitting{pid=Pid, ref=Ref, chashfun=C}) when C =/= sink ->
          {ok, details()} | gone.
 get_details(#fitting{pid=Pid, ref=Ref}, Partition) ->
     try
-        gen_fsm:sync_send_event(Pid, {get_details, Ref, Partition, self()})
+        gen_fsm:sync_send_event(Pid, {get_details, Ref, Partition, self()},
+                                infinity)
     catch exit:{noproc,_} ->
             gone
     end.
