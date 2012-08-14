@@ -62,6 +62,11 @@ start_link() ->
                          pos_integer()},
                         [ supervisor:child_spec() ]}}.
 init([]) ->
+    %% native = vnode understands cmd_enqlist (and cmd_enqueue)
+    %% emulate = vnode only understands cmd_enqueue
+    riak_core_capability:register(
+      {riak_pipe, queue_list}, [native, emulate], emulate),
+
     VMaster = {riak_pipe_vnode_master,
                {riak_core_vnode_master, start_link, [riak_pipe_vnode]},
                permanent, 5000, worker, [riak_core_vnode_master]},

@@ -59,6 +59,8 @@
          collect_results/2,
          queue_work/2,
          queue_work/3,
+         queue_work_list/2,
+         queue_work_list/3,
          eoi/1,
          destroy/1,
          status/1,
@@ -277,6 +279,38 @@ queue_work(#pipe{fittings=[{_,Head}|_]}, Input, Timeout)
   when Timeout =:= infinity; Timeout =:= noblock ->
     riak_pipe_vnode:queue_work(Head, Input, Timeout).
 
+%% @equiv queue_work_list(Pipe, Inputs, infinity)
+queue_work_list(Pipe, Inputs) ->
+    queue_work_list(Pipe, Inputs, infinity).
+
+%% @doc Send a list of inputs to the head of the pipe. Responds with
+%% either an `ok' or `{error, Reason}` tuple, as well as any inputs
+%% that were not enqueued. The list of non-queued inputs should always
+%% be empty if return is `ok' and `Timeout' is `infinity'; it may be
+%% otherwise if return is an error, or `noblock' timeout is used.
+%%
+%% Using this function instead of calling `queue_work/2,3' once for
+%% each input will provide performance improvements when inputs are
+%% going to many vnodes. This is because the wait for each input ack
+%% is delayed until there are no inputs for vnodes that have not yet
+%% acked.
+%%
+%% That is if inputs A, B, C are going to vnodes 1, 2, 1,
+%% respectively, `queue_work(P, [A,B,C], infinity)' will send A to 1
+%% and B to 2, then wait for the ack from 1 before sending C (and then
+%% wait for responses from both 1 and 2). Using `[ queue_work(P, I,
+%% infinity) || I <- [A,B,C] ]' would send A to 1, then wait for a
+%% response, <em>then</em> send B to 2, and again wait for a response,
+%% then finally send C.
+-spec queue_work_list(Pipe::pipe(),
+                      Inputs::list(),
+                      Timeout::riak_pipe_vnode:qtimeout())
+         -> {ok | {error, riak_pipe_vnode:qerror()}, Remaining::list()}.
+queue_work_list(#pipe{fittings=[{_,Head}|_]}, Inputs, Timeout)
+  when is_list(Inputs),
+       (Timeout =:= infinity orelse Timeout =:= noblock) ->
+    riak_pipe_vnode:queue_work_list(Head, Inputs, Timeout).
+    
 %% @doc Pull the next pipeline result out of the sink's mailbox.
 %%      The `From' element of the `result' and `log' messages will
 %%      be the name of the fitting that generated them, as specified
@@ -1674,6 +1708,113 @@ limits_test_() ->
          end}}
       ]
      }.
+
+lists_test_() ->
+    IFun = fun(I) -> I end,
+    List1000Inputs = lists:seq(1, 1000),
+    List1000Driver = fun(P) ->
+                             {ok, []} = riak_pipe:queue_work_list(
+                                          P, List1000Inputs),
+                             riak_pipe:eoi(P)
+                     end,
+    ErrorTrace = [{log, sink}, {trace, [error]}],
+    Sleep1Fun = fun(X) ->
+                        timer:sleep(1),
+                        X
+                end,
+    Send_onehundred_100 = fun(P) ->
+                                  Inputs = [ 100 || _ <- lists:seq(1, 100) ],
+                                  {ok, []} = riak_pipe:queue_work_list(
+                                               P, Inputs),
+                                  riak_pipe:eoi(P)
+                          end,
+    AllLog = [{log, sink}, {trace, all}],
+    {foreach,
+     prepare_runtime(),
+     teardown_runtime(),
+     [
+      fun(_) ->
+              {"basic queue_work_list (native)",
+               fun() ->
+                       ?assertEqual(native, riak_core_capability:get(
+                                              {riak_pipe, queue_list})),
+                       {eoi, Res, Trace} = generic_transform(
+                                             IFun, List1000Driver,
+                                             ErrorTrace, 1),
+                       SortedOutputs = lists:sort([ I || {_,I} <- Res]),
+                       ?assertEqual(List1000Inputs, SortedOutputs),
+                       ?assertEqual([], Trace)
+               end}
+      end,
+      fun(_) ->
+              {"basic queue_work_list (emulate)",
+               fun() ->
+                       riak_core_capability:register(
+                         {riak_pipe, queue_list}, [emulate], emulate),
+                       ?assertEqual(emulate, riak_core_capability:get(
+                                              {riak_pipe, queue_list})),
+                       {eoi, Res, Trace} = generic_transform(
+                                             IFun, List1000Driver,
+                                             ErrorTrace, 1),
+                       SortedOutputs = lists:sort([ I || {_,I} <- Res]),
+                       ?assertEqual(List1000Inputs, SortedOutputs),
+                       ?assertEqual([], Trace)
+               end}
+      end,
+      fun(_) ->
+              {"queue_work_list per worker queue limit enforcement",
+               fun() ->
+                       ?assertEqual(native, riak_core_capability:get(
+                                              {riak_pipe, queue_list})),
+                       {eoi, Res, Trace} =
+                           generic_transform(Sleep1Fun,
+                                             Send_onehundred_100,
+                                             AllLog, 1),
+                       100 = length(Res),
+                       Full = length(extract_queue_full(Trace)),
+                       NoLongerFull = length(extract_unblocking(Trace)),
+                       Full = NoLongerFull,
+                       %% if this assert fails, the test didn't
+                       %% trigger the case it's designed to
+                       ?assert(Full /= 0)
+               end}
+      end,
+      fun(_) ->
+              Inputs = [ 100 || _ <- lists:seq(1, 100) ],
+              FirstMarker = make_ref(),
+              SleepSend = fun(I,P,F) ->
+                                  case get(FirstMarker) of
+                                      true ->
+                                          ok;
+                                      _ ->
+                                          put(FirstMarker, true),
+                                          timer:sleep(1000)
+                                  end,
+                                  riak_pipe_vnode_worker:send_output(I, P, F)
+                          end,
+              {"queue_work_list per worker queue limit with noblock",
+               fun() ->
+                       ?assertEqual(native, riak_core_capability:get(
+                                              {riak_pipe, queue_list})),
+                       {ok, P} = riak_pipe:exec(
+                                   [#fitting_spec{
+                                       name="queue list noblock",
+                                       module=riak_pipe_w_xform,
+                                       arg=SleepSend}],
+                                   []),
+                       {ok, Rest} = riak_pipe:queue_work_list(
+                                      P, Inputs, noblock),
+                       riak_pipe:eoi(P),
+                       {eoi, Result, _Trace} = riak_pipe:collect_results(P),
+                       Processed = length(Result),
+                       Unprocessed = length(Rest),
+                       ?assertEqual(length(Inputs), Processed+Unprocessed),
+                       %% if this assert fails, the test didn't
+                       %% trigger the case it's designed to
+                       ?assert(Unprocessed /= 0)
+               end}
+      end
+     ]}.
 
 should_be_the_very_last_test() ->
     Leftovers = [{Pid, X} ||
