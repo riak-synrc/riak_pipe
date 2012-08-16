@@ -125,7 +125,7 @@
 %% enqlist is enqueue, but for the queue_list function, which needs a
 %% different reply format to operate correctly
 -record(cmd_enqlist, {fitting :: #fitting{},
-                      input :: term(),
+                      inputs :: term(),
                       timeout :: qtimeout(),
                       usedpreflist :: riak_core_apl:preflist()}).
 -record(cmd_eoi, {fitting :: #fitting{}}).
@@ -449,36 +449,39 @@ collect_bins(_Fitting, [], _Timeout, Unqueued, UnknownDowns, Result) ->
     {Result, lists:append(Unqueued)};
 collect_bins(Fitting, Bins, Timeout, Uq, Ud, Result) ->
     case receive_bin(Fitting, Bins) of
-        {ok, #bin{inputs=[_]}, Rest} ->
+        {ok, #bin{}, Rest} ->
             %% inputs finished for this bin
             collect_bins(Fitting, Rest, Timeout, Uq, Ud, Result);
-        {ok, #bin{inputs=[_|Inputs]}, Rest} ->
-            %% send next input
-            case queue_work_bin(Fitting, Inputs, Timeout, []) of
-                {ok, NewBin} ->
-                    collect_bins(Fitting, [NewBin|Rest],
-                                 Timeout, Uq, Ud, Result);
-                {error, _}=Error ->
-                    collect_bins(Fitting, Rest, Timeout,
-                                 [Inputs|Uq], Ud, Error)
-            end;
         {{error, E1}, #bin{inputs=Inputs, used=Used}, Rest} ->
+            {IsTimeout, Leftover} =
+                case E1 of
+                    {timeout, Accepted} ->
+                        %% some of a multi-input
+                        %% enqueue didn't fit
+                        {true, lists:nthtail(Accepted, Inputs)};
+                    timeout ->
+                        %% a single-input enqueue didn't fit
+                        {true, Inputs};
+                    _ ->
+                        %% some other error (like worker startup)
+                        {false, Inputs}
+                end,
             %% error; requeue elsewhere
-            case queue_work_bin(Fitting, Inputs, Timeout, Used) of
+            case queue_work_bin(Fitting, Leftover, Timeout, Used) of
                 {ok, NewBin} ->
                     collect_bins(Fitting, [NewBin|Rest],
                                  Timeout, Uq, Ud, Result);
                 {error, E2}=Error ->
                     if Timeout =:= noblock,
-                       E1 =:= timeout,
+                       IsTimeout,
                        E2 =:= preflist_exhausted ->
                             %% not an error to run out of options
                             %% after timing out on a noblock
                             collect_bins(Fitting, Rest, Timeout,
-                                         [Inputs|Uq], Ud, Result);
+                                         [Leftover|Uq], Ud, Result);
                        true ->
                             collect_bins(Fitting, Rest, Timeout,
-                                         [Inputs|Uq], Ud, Error)
+                                         [Leftover|Uq], Ud, Error)
                     end
             end;
         {error, {unknown_down, Down}} ->
@@ -522,7 +525,7 @@ queue_work_bin(#fitting{nval=Nval}=Fitting,
                [Head|_]=Inputs, Timeout, Used) ->
     Remaining = remaining_preflist(
                   Head, work_hash(Fitting, Head), Nval, Used),
-    case queue_work_bin_send(Fitting, Head, Timeout, Used, Remaining) of
+    case queue_work_bin_send(Fitting, Inputs, Timeout, Used, Remaining) of
         {ok, VnodePid, NewUsed} ->
             MonRef = erlang:monitor(process, VnodePid),
             {ok, #bin{inputs=Inputs,
@@ -539,13 +542,13 @@ queue_work_bin(#fitting{nval=Nval}=Fitting,
                           riak_core_apl:preflist()) ->
          {ok, pid(), riak_core_apl:preflist()}
        | {error, preflist_exhausted}.
-queue_work_bin_send(_Fitting, _Input, _Timeout, _Used, []) ->
+queue_work_bin_send(_Fitting, _Inputs, _Timeout, _Used, []) ->
     {error, preflist_exhausted};
 queue_work_bin_send(#fitting{ref=Ref}=Fitting,
-                    Input, Timeout, Used, [Pref|Remaining]) ->
+                    Inputs, Timeout, Used, [Pref|Remaining]) ->
     NewUsed = [Pref|Used],
     Cmd = #cmd_enqlist{fitting=Fitting,
-                       input=Input,
+                       inputs=Inputs,
                        timeout=Timeout,
                        usedpreflist=NewUsed},
     Sender = {raw, Ref, self()},
@@ -554,10 +557,10 @@ queue_work_bin_send(#fitting{ref=Ref}=Fitting,
         {ok, VnodePid} ->
             {ok, VnodePid, NewUsed};
         {error, _} ->
-            queue_work_bin_send(Fitting, Input, Timeout, NewUsed, Remaining)
+            queue_work_bin_send(Fitting, Inputs, Timeout, NewUsed, Remaining)
     catch exit:{{nodedown, _Node}, _GenServerCall} ->
             %% node died between services check and gen_server:call
-            queue_work_bin_send(Fitting, Input, Timeout, NewUsed, Remaining)
+            queue_work_bin_send(Fitting, Inputs, Timeout, NewUsed, Remaining)
     end.
 
 %% @doc Send end-of-inputs for a fitting to a vnode.  Note: this
@@ -891,40 +894,37 @@ handle_coverage(_Request, _KeySpaces, _Sender, State) ->
 enqueue_internal(#cmd_enqueue{fitting=Fitting, input=Input, timeout=TO,
                               usedpreflist=UsedPreflist},
                  Sender, State) ->
-    enqueue_internal(Fitting, {single, Input},
+    enqueue_internal(Fitting, {single, [Input]},
                      TO, UsedPreflist, Sender, State);
-enqueue_internal(#cmd_enqlist{fitting=Fitting, input=Input, timeout=TO,
+enqueue_internal(#cmd_enqlist{fitting=Fitting, inputs=Inputs, timeout=TO,
                               usedpreflist=UsedPreflist},
                  Sender, State) ->
-    enqueue_internal(Fitting, {list, Input},
+    enqueue_internal(Fitting, {list, Inputs},
                      TO, UsedPreflist, Sender, State).
 
 enqueue_internal(Fitting, Input, TO, UsedPreflist,
                  Sender, #state{partition=Partition}=State) ->
     case worker_for(Fitting, true, State) of
         {ok, #worker{details=#fitting_details{module=riak_pipe_w_crash}}}
-          when Input == {single, vnode_killer} ->
+          when Input == {single, [vnode_killer]} ->
             %% this is used by the eunit test named "Vnode Death"
             %% in riak_pipe:exception_test_; it kills the vnode before
             %% it has a chance to reply to the queue request
             exit({riak_pipe_w_crash, vnode_killer});
         {ok, Worker} when (Worker#worker.details)#fitting_details.module
                           /= ?FORWARD_WORKER_MODULE ->
-            case add_input(Worker, Input, Sender, TO, UsedPreflist) of
+            case add_input(Worker, Partition, Input,
+                           Sender, TO, UsedPreflist) of
                 {ok, NewWorker} ->
-                    ?T(NewWorker#worker.details, [queue],
-                       {vnode, {queued, Partition, element(2, Input)}}),
                     {reply, qreply(Input, ok),
                      replace_worker(NewWorker, State)};
                 {queue_full, NewWorker} ->
-                    ?T(NewWorker#worker.details, [queue,queue_full],
-                       {vnode, {queue_full, Partition, element(2, Input)}}),
                     %% if the queue is full, hold up the producer
                     %% until we're ready for more
                     {noreply, replace_worker(NewWorker, State)};
-                timeout ->
-                    {reply, qreply(Input, {error, timeout}),
-                     replace_worker(Worker, State)}
+                {timeout, NewWorker, Accepted} ->
+                    {reply, qreply(Input, {error, {timeout, Accepted}}),
+                     replace_worker(NewWorker, State)}
             end;
         {ok, _RestartForwardingWorker} ->
             %% this is a forwarding worker for a failed-restart
@@ -948,6 +948,8 @@ enqueue_internal(Fitting, Input, TO, UsedPreflist,
 %% processing.
 -spec qreply(Input::{single|list, term()}, term()) ->
         {pid(), term()} | term().
+qreply({single, _}, {error, {timeout, _}}) ->
+    timeout;
 qreply({single, _}, Reply) ->
     Reply;
 qreply({list, _}, Reply) ->
@@ -1043,27 +1045,52 @@ new_fwd_worker(FittingDetails,
 %% @doc Add an input to the worker's queue.  If the worker is
 %%      `waiting', send the input to it, skipping the queue.  If the
 %%      queue is full, add the request to the blocking queue instead.
--spec add_input(#worker{}, term(), sender(), qtimeout(),
+-spec add_input(#worker{}, partition(),
+                {single | list, list()}, sender(), qtimeout(),
                 riak_core_apl:preflist()) ->
          {ok | queue_full, #worker{}} | timeout.
-add_input(#worker{state=waiting}=Worker,
-          {_Type, Input}, _Sender, _TO, UsedPreflist) ->
+add_input(#worker{state=waiting}=Worker, Partition,
+          {Type, [Input|Rest]}, Sender, TO, UsedPreflist) ->
+    ?T(Worker#worker.details, [queue],
+       {vnode, {queued, Partition, Input}}),
     %% worker has been waiting for something to enter its queue
     send_input(Worker, {Input, UsedPreflist}),
     PerfWorker = roll_perf(Worker),
-    {ok, PerfWorker#worker{state={working, Input}}};
-add_input(#worker{q=Q, q_limit=QL, blocking=Blocking}=Worker,
-          {Type, Input}, Sender, TO, UsedPreflist) ->
-    case queue:len(Q) < QL of
-        true ->
-            {ok, Worker#worker{q=queue:in({Input, UsedPreflist}, Q)}};
-        false when TO =/= noblock ->
-            NewBlocking = queue:in({{Type, Input}, Sender, UsedPreflist},
+    case add_input(PerfWorker#worker{state={working, Input}}, Partition,
+                   {Type, Rest}, Sender, TO, UsedPreflist) of
+        {timeout, NewWorker, Accepted} ->
+            {timeout, NewWorker, Accepted+1};
+        Other ->
+            Other
+    end;
+add_input(#worker{q=Q, q_limit=QL, blocking=Blocking}=Worker, Partition,
+          {Type, Inputs}, Sender, TO, UsedPreflist) ->
+    case queue_n(QL - queue:len(Q), Inputs, UsedPreflist, Q,
+                 Worker, Partition) of
+        {_, [], NewQ} ->
+            {ok, Worker#worker{q=NewQ}};
+        {_, Rest, NewQ} when TO =/= noblock ->
+            %% send each input as a separate trace, for
+            %% compatibility with 1.2-and-earlier trace loggers
+            [?T(Worker#worker.details, [queue,queue_full],
+                {vnode, {queue_full, Partition, I}})
+             || I <- Rest],
+            NewBlocking = queue:in({{Type, Rest}, Sender, UsedPreflist},
                                    Blocking),
-            {queue_full, Worker#worker{blocking=NewBlocking}};
-        false ->
-            timeout
+            {queue_full, Worker#worker{q=NewQ, blocking=NewBlocking}};
+        {Accepted, _, NewQ} ->
+            {timeout, Worker#worker{q=NewQ}, Accepted}
     end.
+
+queue_n(N, L, UP, Q, W, P) ->
+    queue_n(N, L, UP, Q, 0, W, P).                        
+queue_n(0, L, _UP, Q, C, _W, _P) ->
+    {C, L, Q};
+queue_n(_N, []=L, _UP, Q, C, _W, _P) ->
+    {C, L, Q};
+queue_n(N, [H|L], UP, Q, C, W, P) ->
+    ?T(W#worker.details, [queue], {vnode, {queued, P, H}}),
+    queue_n(N-1, L, UP, queue:in({H,UP},Q), C+1, W, P).
 
 %% @doc Merge the worker on this vnode with the worker from another
 %%      vnode.  (The grungy part of {@link handle_handoff_data/2}.)
@@ -1171,16 +1198,26 @@ next_input_nohandoff(WorkerUnperf, #state{partition=Partition}=State) ->
             BlockingWorker = 
                 case {queue:len(NewQ) < Worker#worker.q_limit,
                       queue:out(Worker#worker.blocking)} of
-                    {true, {{value, {{_,BlockInput}=BI,
+                    {true, {{value, {{Type,[NextBlockInput|BlockInputs]}=BI,
                                      Blocker, BlockUsedPreflist}},
-                            NewBlocking}} ->
+                            NewBlocking0}} ->
                         ?T(Worker#worker.details, [queue,queue_full],
                            {vnode, {unblocking, Partition}}),
                         %% move blocked input to queue
-                        NewNewQ = queue:in({BlockInput, BlockUsedPreflist},
+                        NewNewQ = queue:in({NextBlockInput, BlockUsedPreflist},
                                            NewQ),
-                        %% free up blocked sender
-                        reply_to_blocker(Blocker, BI, ok),
+                        case BlockInputs of
+                            [] ->
+                                %% free up blocked sender
+                                reply_to_blocker(Blocker, BI, ok),
+                                NewBlocking = NewBlocking0;
+                            _ ->
+                                %% still blocking on some
+                                NewBlocking = queue:in_r({{Type, BlockInputs},
+                                                          Blocker,
+                                                          BlockUsedPreflist},
+                                                         NewBlocking0)
+                        end,
                         WorkingWorker#worker{q=NewNewQ,
                                              blocking=NewBlocking};
                     {False, {Empty, _}} when False==false; Empty==empty ->
