@@ -685,6 +685,10 @@ extract_queued(Trace) ->
     [{Partition, X} ||
         {_, {trace, _, {vnode, {queued, Partition, X}}}} <- Trace].
 
+extract_dequeue_list(Trace) ->
+    [Partition ||
+        {_, {trace, _, {vnode, {dequeue_list, Partition}}}} <- Trace].
+
 extract_queue_full(Trace) ->
     [Partition ||
         {_, {trace, _, {vnode, {queue_full, Partition, _}}}} <- Trace].
@@ -1812,6 +1816,26 @@ lists_test_() ->
                        %% if this assert fails, the test didn't
                        %% trigger the case it's designed to
                        ?assert(Unprocessed /= 0)
+               end}
+      end,
+      fun(_) ->
+              {"worker next_input_list",
+               fun() ->
+                       Inputs = lists:seq(1, 1000),
+                       {ok, P} = riak_pipe:exec(
+                                   [#fitting_spec{
+                                       name="worker next_input",
+                                       module=riak_pipe_w_pass,
+                                       arg=[drain],
+                                       chashfun= <<0:160/integer>>}],
+                                   [{log, sink},{trace,[queue]}]),
+                       {ok, []} = riak_pipe:queue_work_list(
+                                    P, Inputs),
+                       riak_pipe:eoi(P),
+                       {eoi, Result, Trace} = riak_pipe:collect_results(P),
+                       ?assertEqual(Inputs,
+                                    lists:reverse([O || {_, O} <- Result])),
+                       ?assert([] =/= extract_dequeue_list(Trace))
                end}
       end
      ]}.

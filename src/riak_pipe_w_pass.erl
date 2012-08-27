@@ -20,8 +20,13 @@
 
 %% @doc Simple pass-thru fitting.  Just passes its input directly to
 %%      its output.  This fitting should work with any consistent-hash
-%%      function.  It ignores its argument, and requires no archiving
-%%      for handoff.
+%%      function.  It requires no archiving for handoff.
+%%
+%%      If its argument is a list, this fitting passes that list back
+%%      as the `Props' value in the `init/2' result. This can be used
+%%      to enable next-input list requests by passing `[drain]' as the
+%%      argument.  When configured for `black_hole' mode,
+%%      next-input-list is also enabled.
 -module(riak_pipe_w_pass).
 -behaviour(riak_pipe_vnode_worker).
 
@@ -42,7 +47,12 @@
            riak_pipe_fitting:details()) ->
         {ok, state()}.
 init(Partition, FittingDetails) ->
-    {ok, #state{p=Partition, fd=FittingDetails}}.
+    Props = case FittingDetails#fitting_details.arg of
+                A when is_list(A) -> A;
+                black_hole        -> [drain];
+                _                 -> []
+            end,
+    {ok, Props, #state{p=Partition, fd=FittingDetails}}.
 
 %% @doc Process just sends `Input' directly to the next fitting.  This
 %%      function also generates two trace messages: `{processing,

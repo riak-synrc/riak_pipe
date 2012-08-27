@@ -191,7 +191,10 @@ wait_upstream_eoi({eoi, Ref},
         #fitting_details{module=Module, options=Os0} = Details,
         true = Module:no_input_run_reduce_once(),
         Os = [pipe_fitting_no_input|Os0],
-        {ok, WState1} = Module:init(0, Details#fitting_details{options=Os}),
+        case Module:init(0, Details#fitting_details{options=Os}) of
+            {ok, WState1} -> ok;
+            {ok, _Props, WState1} -> ok
+        end,
         _ = Module:done(WState1)
     catch
         error:_ ->                              % undef or badmatch

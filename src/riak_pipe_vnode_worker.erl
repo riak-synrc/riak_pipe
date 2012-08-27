@@ -28,6 +28,7 @@
 %% init(Partition :: riak_pipe_vnode:partition(),
 %%      FittingDetails :: riak_pipe_fitting:details())
 %%   -> {ok, ModuleState :: term()}
+%%    | {ok, Props :: proplist(), ModuleState :: term()}
 %% '''
 %%
 %%      The `init/2' function is called when the worker starts.  The
@@ -37,6 +38,21 @@
 %%      state, as it will need them to send outputs later.  The
 %%      `ModuleState' returned from this function will be passed to
 %%      the `process/3' function later.
+%%
+%%      The optional `Props' proplist is used to enable or disable
+%%      worker behaviors.  Current behaviors include:
+%%
+%% <dl> <dt>`drain'</dt>
+%%
+%%      <dd>By default, the worker requests one input at a time from
+%%      its vnode. When `drain' is included in the `Props' list, the
+%%      worker instead requests all inputs that are currently in the
+%%      worker's queue at once. This can improve efficiency by
+%%      reducing the number of messages that must pass between a
+%%      worker and its vnode. Inputs are still given to the
+%%      `process/3' function one at a time.</dd>
+%%
+%% </dl>
 %%
 %% ```
 %% process(Input :: term(),
@@ -159,6 +175,7 @@
 -record(state, {partition :: riak_pipe_vnode:partition(),
                 details :: riak_pipe_fitting:details(),
                 vnode :: pid(),
+                nitype :: riak_pipe_vnode:nitype(),
                 modstate :: term()}).
 -opaque state() :: #state{}.
 
@@ -322,15 +339,32 @@ init([Partition, VnodePid, #fitting_details{module=Module}=FittingDetails]) ->
                     {partition, Partition},
                     {VnodePid, VnodePid},
                     {details, FittingDetails}]),
-        {ok, ModState} = Module:init(Partition, FittingDetails),
+        case Module:init(Partition, FittingDetails) of
+            {ok, ModState}        -> Props = [];
+            {ok, Props, ModState} -> ok
+        end,
         {ok, initial_input_request,
          #state{partition=Partition,
                 details=FittingDetails,
                 vnode=VnodePid,
+                nitype=next_input_type(Props),
                 modstate=ModState},
          0}
     catch Type:Error ->
             {stop, {init_failed, Type, Error}}
+    end.
+
+%% @doc Choose the type of next-input requests that this worker will
+%% send to its vnode.
+-spec next_input_type(list()) -> riak_pipe_vnode:nitype().
+next_input_type(Props) ->
+    case proplists:get_value(drain, Props) of
+        true ->
+            %% ask the vnode for all inputs enqueued at once
+            list;
+        _ ->
+            %% ask the vnode for one input at a time
+            one
     end.
 
 %% @doc The worker has just started, and should request its first
@@ -375,6 +409,17 @@ wait_for_input({input, done}, State) ->
     {stop, normal, State}; %%TODO: monitor
 wait_for_input({input, {Input, UsedPreflist}}, State) ->
     NewState = process_input(Input, UsedPreflist, State),
+    request_input(NewState),
+    {next_state, wait_for_input, NewState};
+wait_for_input({input, Inputs}, State) ->
+    %% lists of inputs are still evaluated one by one for now, just
+    %% delivered to this process in one list
+    NewState = lists:foldl(
+                 fun({Input, UsedPreflist}, Acc) ->
+                         process_input(Input, UsedPreflist, Acc)
+                 end,
+                 State,
+                 Inputs),
     request_input(NewState),
     {next_state, wait_for_input, NewState};
 wait_for_input({handoff, HandoffState}, State) ->
@@ -425,8 +470,10 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %% @doc Ask the vnode for this worker's next input.  The input will be
 %%      sent as an event later.
 -spec request_input(state()) -> ok.
-request_input(#state{vnode=Vnode, details=Details}) ->
-    riak_pipe_vnode:next_input(Vnode, Details#fitting_details.fitting).
+request_input(#state{nitype=one, vnode=Vnode, details=Details}) ->
+    riak_pipe_vnode:next_input(Vnode, Details#fitting_details.fitting);
+request_input(#state{nitype=list, vnode=Vnode, details=Details}) ->
+    riak_pipe_vnode:next_input_list(Vnode, Details#fitting_details.fitting).
 
 %% @doc Process an input - call the implementing module's `process/3'
 %%      function.

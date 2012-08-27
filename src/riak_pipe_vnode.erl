@@ -45,6 +45,7 @@
          queue_work_list/3,
          eoi/2,
          next_input/2,
+         next_input_list/2,
          reply_archive/3,
          status/1,
          status/2]).
@@ -60,7 +61,8 @@
               partition/0, %% from riak_core_vnode.hrl
               nval/0,
               qtimeout/0,
-              qerror/0]).
+              qerror/0,
+              nitype/0]).
 -type chashfun() :: {Module :: atom(), Function :: atom()}
                   | chash()
                   | follow
@@ -77,6 +79,7 @@
                 | forwarding
                 | preflist_exhausted.
 -type down_message() :: {'DOWN', reference(), process, pid(), term()}.
+-type nitype() :: one | list.
 
 -define(DEFAULT_WORKER_LIMIT, 50).
 -define(DEFAULT_WORKER_Q_LIMIT, 4096).
@@ -91,7 +94,7 @@
 -record(worker, {pid :: pid(),
                  fitting :: #fitting{},
                  details :: #fitting_details{},
-                 state :: {working, term()} | waiting | init,
+                 state :: {working, term()} | {waiting, nitype()} | init,
                  inputs_done :: boolean(),
                  q :: queue(),
                  q_limit :: pos_integer(),
@@ -129,7 +132,8 @@
                       timeout :: qtimeout(),
                       usedpreflist :: riak_core_apl:preflist()}).
 -record(cmd_eoi, {fitting :: #fitting{}}).
--record(cmd_next_input, {fitting :: #fitting{}}).
+-record(cmd_next_input, {fitting :: #fitting{},
+                         type :: nitype()}).
 -record(cmd_archive, {fitting :: #fitting{},
                       archive :: term()}).
 -record(cmd_status, {sender :: term(),
@@ -579,7 +583,18 @@ eoi(Pid, Fitting) ->
 %%      fitting.
 -spec next_input(pid(), riak_pipe:fitting()) -> ok.
 next_input(Pid, Fitting) ->
-    riak_core_vnode:send_command(Pid, #cmd_next_input{fitting=Fitting}).
+    riak_core_vnode:send_command(
+      Pid, #cmd_next_input{fitting=Fitting, type=one}).
+
+%% @doc Request all inputs in the queue for the given fitting from a
+%%      vnode.  Note: this should only be called by the worker process
+%%      for that fitting-vnode pair.  This will cause the vnode to
+%%      send everything that is in the queue (non-blocking) to the
+%%      worker process for this fitting.
+-spec next_input_list(pid(), riak_pipe:fitting()) -> ok.
+next_input_list(Pid, Fitting) ->
+    riak_core_vnode:send_command(
+      Pid, #cmd_next_input{fitting=Fitting, type=list}).
 
 %% @doc Send the result of archiving a worker to the vnode that owns
 %%      that worker.  Note: this should only be called by the worker
@@ -1042,6 +1057,13 @@ new_fwd_worker(FittingDetails,
                  blocking=queue:new(),
                  perf=Perf}}.
 
+%% @doc A fun to send 'queued' traces as multiple inputs are added to
+%% the queue.
+trace_queue(Details, Partition) ->
+    fun(Input) ->
+            ?T(Details, [queue], {vnode, {queued, Partition, Input}})
+    end.
+
 %% @doc Add an input to the worker's queue.  If the worker is
 %%      `waiting', send the input to it, skipping the queue.  If the
 %%      queue is full, add the request to the blocking queue instead.
@@ -1049,11 +1071,10 @@ new_fwd_worker(FittingDetails,
                 {single | list, list()}, sender(), qtimeout(),
                 riak_core_apl:preflist()) ->
          {ok | queue_full, #worker{}} | timeout.
-add_input(#worker{state=waiting}=Worker, Partition,
+add_input(#worker{state={waiting, one}, details=D}=Worker, Partition,
           {Type, [Input|Rest]}, Sender, TO, UsedPreflist) ->
-    ?T(Worker#worker.details, [queue],
-       {vnode, {queued, Partition, Input}}),
-    %% worker has been waiting for something to enter its queue
+    %% worker has been waiting for the first thing to enter its queue
+    (trace_queue(D, Partition))(Input),
     send_input(Worker, {Input, UsedPreflist}),
     PerfWorker = roll_perf(Worker),
     case add_input(PerfWorker#worker{state={working, Input}}, Partition,
@@ -1063,10 +1084,26 @@ add_input(#worker{state=waiting}=Worker, Partition,
         Other ->
             Other
     end;
-add_input(#worker{q=Q, q_limit=QL, blocking=Blocking}=Worker, Partition,
+add_input(#worker{state={waiting, list},q=Q,q_limit=QL,details=D}=Worker,
+          Partition,
           {Type, Inputs}, Sender, TO, UsedPreflist) ->
+    %% worker has been waiting for things to enter its queue;
+    %% send as much as would fit in its queue, then enqueue the rest
+    {Accepted, Rest, NewQ} = queue_n(QL, Inputs, UsedPreflist, Q,
+                                     trace_queue(D, Partition)),
+    send_input(Worker, queue:to_list(NewQ)),
+    PerfWorker = roll_perf(Worker),
+    case add_input(PerfWorker#worker{state={working, Inputs}}, Partition,
+                   {Type, Rest}, Sender, TO, UsedPreflist) of
+        {timeout, NewWorker, NewAccepted} ->
+            {timeout, NewWorker, NewAccepted+Accepted};
+        Other ->
+            Other
+    end;
+add_input(#worker{q=Q, q_limit=QL, blocking=Blocking, details=D}=Worker,
+          Partition, {Type, Inputs}, Sender, TO, UsedPreflist) ->
     case queue_n(QL - queue:len(Q), Inputs, UsedPreflist, Q,
-                 Worker, Partition) of
+                 trace_queue(D, Partition)) of
         {_, [], NewQ} ->
             {ok, Worker#worker{q=NewQ}};
         {_, Rest, NewQ} when TO =/= noblock ->
@@ -1082,15 +1119,27 @@ add_input(#worker{q=Q, q_limit=QL, blocking=Blocking}=Worker, Partition,
             {timeout, Worker#worker{q=NewQ}, Accepted}
     end.
 
-queue_n(N, L, UP, Q, W, P) ->
-    queue_n(N, L, UP, Q, 0, W, P).                        
-queue_n(0, L, _UP, Q, C, _W, _P) ->
+%% @doc Queue `N' items from list `L' with used-preflist `UP', into
+%% queue `Q', tracing this queing with function `T'. Returns the
+%% number of items queued, `C' =&lt; `N', the remainder of `L', and
+%% the new queue.
+-spec queue_n(non_neg_integer(),
+              list(),
+              riak_core_apl:preflist(),
+              queue(),
+              fun((_) -> any()))
+         -> {Accepted::non_neg_integer(),
+             Remaining::list(),
+             Queue::queue()}.
+queue_n(N, L, UP, Q, T) ->
+    queue_n(N, L, UP, Q, 0, T).
+queue_n(0, L, _UP, Q, C, _T) ->
     {C, L, Q};
-queue_n(_N, []=L, _UP, Q, C, _W, _P) ->
+queue_n(_N, []=L, _UP, Q, C, _T) ->
     {C, L, Q};
-queue_n(N, [H|L], UP, Q, C, W, P) ->
-    ?T(W#worker.details, [queue], {vnode, {queued, P, H}}),
-    queue_n(N-1, L, UP, queue:in({H,UP},Q), C+1, W, P).
+queue_n(N, [H|L], UP, Q, C, T) ->
+    T(H), %% trace function hook
+    queue_n(N-1, L, UP, queue:in({H,UP},Q), C+1, T).
 
 %% @doc Merge the worker on this vnode with the worker from another
 %%      vnode.  (The grungy part of {@link handle_handoff_data/2}.)
@@ -1110,7 +1159,7 @@ handoff_worker(#worker{q=Q, blocking=Blocking}=Worker,
 %%      process.  Otherwise, just leave it be until it asks for the
 %%      next input.
 -spec maybe_wake_for_handoff(#worker{}) -> #worker{}.
-maybe_wake_for_handoff(#worker{state=waiting}=Worker) ->
+maybe_wake_for_handoff(#worker{state={waiting, _}}=Worker) ->
     send_handoff(Worker),
     Worker#worker{state={working, handoff}, handoff=undefined};
 maybe_wake_for_handoff(Worker) ->
@@ -1126,7 +1175,7 @@ eoi_internal(#cmd_eoi{fitting=Fitting}, #state{partition=Partition}=State) ->
     NewState = case worker_by_fitting(Fitting, State) of
                    {ok, Worker} ->
                        case Worker#worker.state of
-                           waiting ->
+                           {waiting, _} ->
                                ?T(Worker#worker.details, [eoi],
                                   {vnode, {eoi, Partition}}),
                                send_input(Worker, done),
@@ -1155,10 +1204,10 @@ eoi_internal(#cmd_eoi{fitting=Fitting}, #state{partition=Partition}=State) ->
 %%      If this vnode is not handing off, send the next input.
 -spec next_input_internal(#cmd_next_input{}, state()) ->
           {noreply, #state{}}.
-next_input_internal(#cmd_next_input{fitting=Fitting}, State) ->
+next_input_internal(#cmd_next_input{fitting=Fitting, type=Type}, State) ->
     case worker_by_fitting(Fitting, State) of
         {ok, #worker{handoff=undefined}=Worker} ->
-            next_input_nohandoff(Worker, State);
+            next_input_nohandoff(Worker, Type, State);
         {ok, Worker} ->
             send_handoff(Worker),
             HandoffWorker = Worker#worker{state={working, handoff},
@@ -1185,60 +1234,94 @@ next_input_internal(#cmd_next_input{fitting=Fitting}, State) ->
 %%      send it along.  If there are items in the blocking queue, move
 %%      the front one to the end of the work queue, and reply `ok' to
 %%      the process that requested its addition (unblocking it).
--spec next_input_nohandoff(#worker{}, state()) -> {noreply, state()}.
-next_input_nohandoff(WorkerUnperf, #state{partition=Partition}=State) ->
+-spec next_input_nohandoff(#worker{}, nitype(), state()) ->
+         {noreply, state()}.
+next_input_nohandoff(WorkerUnperf,
+                     Type,
+                     #state{partition=Partition}=State) ->
     Worker = roll_perf(WorkerUnperf),
-    case queue:out(Worker#worker.q) of
-        {{value, {Input, UsedPreflist}}, NewQ} ->
-            ?T(Worker#worker.details, [queue],
-               {vnode, {dequeue, Partition}}),
-            send_input(Worker, {Input, UsedPreflist}),
+    case niqout(Type, Worker#worker.q, Worker#worker.details, Partition) of
+        {Input, NewQ} ->
+            send_input(Worker, Input),
             WorkingWorker = Worker#worker{state={working, Input},
                                           q=NewQ},
-            BlockingWorker = 
-                case {queue:len(NewQ) < Worker#worker.q_limit,
-                      queue:out(Worker#worker.blocking)} of
-                    {true, {{value, {{Type,[NextBlockInput|BlockInputs]}=BI,
-                                     Blocker, BlockUsedPreflist}},
-                            NewBlocking0}} ->
-                        ?T(Worker#worker.details, [queue,queue_full],
-                           {vnode, {unblocking, Partition}}),
-                        %% move blocked input to queue
-                        NewNewQ = queue:in({NextBlockInput, BlockUsedPreflist},
-                                           NewQ),
-                        case BlockInputs of
-                            [] ->
-                                %% free up blocked sender
-                                reply_to_blocker(Blocker, BI, ok),
-                                NewBlocking = NewBlocking0;
-                            _ ->
-                                %% still blocking on some
-                                NewBlocking = queue:in_r({{Type, BlockInputs},
-                                                          Blocker,
-                                                          BlockUsedPreflist},
-                                                         NewBlocking0)
-                        end,
-                        WorkingWorker#worker{q=NewNewQ,
-                                             blocking=NewBlocking};
-                    {False, {Empty, _}} when False==false; Empty==empty ->
-                        %% nothing blocking, or handoff pushed queue
-                        %% length over q_limit
-                        WorkingWorker
-                end,
-            {noreply, replace_worker(BlockingWorker, State)};
+            FinalWorker = maybe_unblock(queue:len(NewQ)-Worker#worker.q_limit,
+                                        WorkingWorker, Partition);
+        empty ->
+            FinalWorker = maybe_done(Worker, Type, Partition)
+    end,
+    {noreply, replace_worker(FinalWorker, State)}.
+
+%% @doc Pull things out of the blocking queue if there is room in the
+%% input queue. First parameter is the maximum number of items to unblock.
+-spec maybe_unblock(non_neg_integer(), #worker{}, partition()) -> #worker{}.
+maybe_unblock(0, Worker, _Partition) ->
+    Worker;
+maybe_unblock(L, #worker{q=Q, blocking=B, details=D}=Worker, Partition) ->
+    case queue:out(B) of
+        {{value, {{Type,BlockInputs}=BI,
+                  Blocker, BlockUsedPreflist}},
+         NewB} ->
+            Trace = fun(_) ->
+                            ?T(D, [queue,queue_full],
+                               {vnode, {unblocking, Partition}})
+                    end,
+            {Accepted, Rest, NewQ} = queue_n(L, BlockInputs,
+                                             BlockUsedPreflist,
+                                             Q, Trace),
+            case Rest of
+                [] ->
+                    %% finished queueing for this request,
+                    %% free up blocked sender
+                    reply_to_blocker(Blocker, BI, ok),
+                    maybe_unblock(L-Accepted,
+                                  Worker#worker{q=NewQ, blocking=NewB},
+                                  Partition);
+                _ ->
+                    %% still more items to queue for this request,
+                    %% continue blocking
+                    StillB = queue:in_r({{Type, BlockInputs},
+                                         Blocker,
+                                         BlockUsedPreflist},
+                                        NewB),
+                    Worker#worker{q=NewQ, blocking=StillB}
+            end;
         {empty, _} ->
-            EmptyWorker = case Worker#worker.inputs_done of
-                              true ->
-                                  ?T(Worker#worker.details, [eoi],
-                                     {vnode, {eoi, Partition}}),
-                                  send_input(Worker, done),
-                                  Worker#worker{state={working, done}};
-                              false ->
-                                  ?T(Worker#worker.details, [queue],
-                                     {vnode, {waiting, Partition}}),
-                                  Worker#worker{state=waiting}
-                          end,
-            {noreply, replace_worker(EmptyWorker, State)}
+            %% nothing blocking - just continue
+            Worker
+    end.
+
+%% @doc Send the `done' signal to the worker if we have received eoi
+%% for it.
+-spec maybe_done(#worker{}, nitype(), partition()) -> #worker{}.
+maybe_done(#worker{inputs_done=true}=Worker, _Type, Partition) ->
+    ?T(Worker#worker.details, [eoi], {vnode, {eoi, Partition}}),
+    send_input(Worker, done),
+    Worker#worker{state={working, done}};
+maybe_done(#worker{inputs_done=false}=Worker, Type, Partition) ->
+    ?T(Worker#worker.details, [queue], {vnode, {waiting, Partition}}),
+    Worker#worker{state={waiting, Type}}.
+
+%% @doc Prepare the correct "next input" response type, depending on
+%% whether the worker requested one input, or the whole queue as a
+%% list.
+-spec niqout(nitype(), queue(), #fitting_details{}, partition()) ->
+         {Input::term(), NewQueue::queue()} | empty.
+niqout(one, Q, Details, Partition) ->
+    case queue:out(Q) of
+        {{value, I}, NewQ} ->
+            ?T(Details, [queue], {vnode, {dequeue, Partition}}),
+            {I, NewQ};
+        {empty, _} ->
+            empty
+    end;
+niqout(list, Q, Details, Partition) ->
+    case queue:to_list(Q) of
+        [] ->
+            empty;
+        L ->
+            ?T(Details, [queue], {vnode, {dequeue_list, Partition}}),
+            {L, queue:new()}
     end.
 
 %% @doc Send an input to a worker.
@@ -1466,7 +1549,9 @@ proplist_perf(#worker{perf=Perf, state=State}) ->
 handoff_cmd_internal(?FOLD_REQ{foldfun=Fold, acc0=Acc}, Sender,
               #state{workers=Workers}=State) ->
     {Ready, NotReady} = lists:partition(
-                          fun(W) -> W#worker.state == waiting end,
+                          fun(#worker{state={waiting,_}}) -> true;
+                             (_)                          -> false
+                          end,
                           Workers),
     %% ask waiting workers to produce archives
     Archiving = [ begin
