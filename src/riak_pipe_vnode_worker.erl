@@ -154,7 +154,9 @@
          send_archive/1,
          send_output/3,
          send_output/4,
-         send_output/5]).
+         send_output/5,
+         send_output_list/3,
+         send_output_list/4]).
 -export([behaviour_info/1]).
 
 %% gen_fsm callbacks
@@ -321,6 +323,55 @@ send_output(Output, FromPartition,
             riak_pipe_vnode:queue_work(
               FittingOverride, Output, Timeout, UsedPreflist)
     end.
+
+%% @equiv send_output_list(Outputs, FromPartition, Details, infinity)
+send_output_list(Outputs, FromPartition, Details) ->
+    send_output_list(Outputs, FromPartition, Details, infinity).
+
+%% @doc Send outputs from the given fitting to the next output down the
+%%      line. `FromPartition' is used in the case that the next
+%%      fitting's partition function is `follow'.
+-spec send_output_list(list(),
+                       riak_pipe_vnode:partition(),
+                       riak_pipe_fitting:details(),
+                       riak_pipe_vnode:qtimeout()) ->
+         {ok |{error, term()}, Remainder::list()}.
+send_output_list(Outputs, FromPartition, Details, Timeout) ->
+    case riak_core_capability:get({riak_pipe, queue_list}) of
+        native ->
+            send_output_list_native(
+              Outputs, FromPartition, Details, Timeout);
+        emulate ->
+            send_output_list_emulate(
+              Outputs, FromPartition, Details, Timeout)
+    end.
+
+send_output_list_native(Outputs, FromPartition,
+                        #fitting_details{name=Name, output=Fitting},
+                        Timeout) ->
+    case Fitting#fitting.chashfun of
+        sink ->
+            riak_pipe_sink:result_list(Name, Fitting, Outputs),
+            ok;
+        follow ->
+            Bin = {riak_pipe_vnode:hash_for_partition(FromPartition),
+                   Outputs},
+            %% TODO: include UsedPreflist like non-list follow case?
+            riak_pipe_vnode:queue_work_bins(Fitting, [Bin], Timeout);
+        _ ->
+            riak_pipe_vnode:queue_work_list(Fitting, Outputs, Timeout)
+    end.
+
+send_output_list_emulate([Next|Outputs], FromPartition, Details, Timeout) ->
+    case send_output(Next, FromPartition, Details, Timeout) of
+        ok ->
+            send_output_list_emulate(
+              Outputs, FromPartition, Details, Timeout);
+        {error,_}=Error ->
+            {Error, Outputs}
+    end;
+send_output_list_emulate([], _From, _Details, _Timeout) ->
+    {ok, []}.
 
 %%%===================================================================
 %%% gen_fsm callbacks

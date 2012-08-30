@@ -20,12 +20,14 @@
 
 %% @doc Methods for sending messages to the sink.
 %%
-%%      Sink messages are delivered as three record types:
-%%      `#pipe_result{}', `#pipe_log{}', and `#pipe_eoi{}'.
+%%      Sink messages are delivered as four record types:
+%%      `#pipe_result{}', `#pipe_result_list{}`, `#pipe_log{}',
+%%      and `#pipe_eoi{}'.
 -module(riak_pipe_sink).
 
 -export([
          result/3,
+         result_list/3,
          log/3,
          eoi/1
         ]).
@@ -38,6 +40,14 @@
 -spec result(term(), Sink::riak_pipe:fitting(), term()) -> #pipe_result{}.
 result(From, #fitting{pid=Pid, ref=Ref, chashfun=sink}, Output) ->
     Pid ! #pipe_result{ref=Ref, from=From, result=Output}.
+
+%% @doc Send a result to the sink (used by worker processes).  The
+%%      result is delivered as a `#pipe_result{}' record in the sink
+%%      process's mailbox.
+-spec result_list(term(), Sink::riak_pipe:fitting(), list()) ->
+         #pipe_result_list{}.
+result_list(From, #fitting{pid=Pid, ref=Ref, chashfun=sink}, Outputs) ->
+    Pid ! #pipe_result_list{ref=Ref, from=From, results=Outputs}.
 
 %% @doc Send a log message to the sink (used by worker processes and
 %%      fittings).  The message is delivered as a `#pipe_log{}' record

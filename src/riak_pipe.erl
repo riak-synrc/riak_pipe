@@ -321,6 +321,7 @@ queue_work_list(#pipe{fittings=[{_,Head}|_]}, Inputs, Timeout)
 %%      A static timeout of five seconds is hard-coded (TODO).
 -spec receive_result(pipe()) ->
          {result, {From::term(), Result::term()}}
+       | {result_list, {From::term(), Results::list()}}
        | {log, {From::term(), Message::term()}}
        | eoi
        | timeout.
@@ -329,6 +330,7 @@ receive_result(Pipe) ->
 
 -spec receive_result(Pipe::pipe(), Timeout::integer() | 'infinity') ->
          {result, {From::term(), Result::term()}}
+       | {result_list, {From::term(), Results::list()}}
        | {log, {From::term(), Message::term()}}
        | eoi
        | timeout.
@@ -336,6 +338,8 @@ receive_result(#pipe{sink=#fitting{ref=Ref}}, Timeout) ->
     receive
         #pipe_result{ref=Ref, from=From, result=Result} ->
             {result, {From, Result}};
+        #pipe_result_list{ref=Ref, from=From, results=Results} ->
+            {result_list, {From, Results}};
         #pipe_log{ref=Ref, from=From, msg=Msg} ->
             {log, {From, Msg}};
         #pipe_eoi{ref=Ref} ->
@@ -390,6 +394,9 @@ collect_results(Pipe, ResultAcc, LogAcc, Timeout) ->
     case receive_result(Pipe, Timeout) of
         {result, {From, Result}} ->
             collect_results(Pipe, [{From,Result}|ResultAcc], LogAcc, Timeout);
+        {result_list, {From, Results}} ->
+            FR = [{From, R} || R <- Results],
+            collect_results(Pipe, FR++ResultAcc, LogAcc, Timeout);
         {log, {From, Result}} ->
             collect_results(Pipe, ResultAcc, [{From,Result}|LogAcc], Timeout);
         End ->

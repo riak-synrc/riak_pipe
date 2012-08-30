@@ -41,6 +41,13 @@
           result
         }).
 
+-record(pipe_result_list,
+        {
+          ref,
+          from,
+          results
+        }).
+
 -record(pipe_eoi,
         {
           ref

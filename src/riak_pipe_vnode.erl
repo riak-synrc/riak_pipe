@@ -43,6 +43,7 @@
          queue_work/4,
          queue_work/5,
          queue_work_list/3,
+         queue_work_bins/3,
          eoi/2,
          next_input/2,
          next_input_list/2,
@@ -141,6 +142,7 @@
 %% used during queue_list multiplexing
 -record(bin, {
           inputs :: list(),
+          hash :: chash(),
           vnode :: pid(),
           monitor :: reference(),
           used :: riak_core_apl:preflist()
@@ -403,8 +405,9 @@ queue_work_list_emulate(_Fitting, [], _Timeout) ->
 
 %% @doc Actual implementation of post-1.2 `queue_work_list' (internal).
 queue_work_list_native(Fitting, Inputs, Timeout) ->
-    IBins = bin_inputs(Fitting, Inputs),
+    queue_work_bins(Fitting, bin_inputs(Fitting, Inputs), Timeout).
 
+queue_work_bins(Fitting, IBins, Timeout) ->
     %% bootstrap the pump by sending the first enqueue requests
     FirstQFun = fun(B, {Bins, Unqueued, Result}) ->
                         case queue_work_bin(Fitting, B, Timeout, []) of
@@ -420,7 +423,8 @@ queue_work_list_native(Fitting, Inputs, Timeout) ->
     collect_bins(Fitting, Bins, Timeout, Unqueued, [], Result).
 
 %% @doc Partition Inputs into bins according to the head of their preflist.
--spec bin_inputs(riak_pipe:fitting(), [term()]) -> [ Bin::[term()] ].
+-spec bin_inputs(riak_pipe:fitting(), [term()]) ->
+         [ Bin::{chash(), [term()]} ].
 bin_inputs(Fitting, Inputs) ->
     {ok, Ring} = riak_core_ring_manager:get_my_ring(),
     %% some fittings expect their outputs to remain in the order
@@ -439,7 +443,7 @@ bin_inputs(Fitting, Inputs) ->
               end,
               [],
               Inputs),
-    [ Bin || {_P, Bin} <- PBins].
+    [ {work_hash(Fitting, hd(Bin)), Bin} || {_P, Bin} <- PBins].
 
 %% @doc The multiplexing pump. Waits for a reply from any vnode, then
 %% sends the next input scheduled for that vnode.
@@ -456,7 +460,7 @@ collect_bins(Fitting, Bins, Timeout, Uq, Ud, Result) ->
         {ok, #bin{}, Rest} ->
             %% inputs finished for this bin
             collect_bins(Fitting, Rest, Timeout, Uq, Ud, Result);
-        {{error, E1}, #bin{inputs=Inputs, used=Used}, Rest} ->
+        {{error, E1}, #bin{inputs=Inputs, used=Used, hash=Hash}, Rest} ->
             {IsTimeout, Leftover} =
                 case E1 of
                     {timeout, Accepted} ->
@@ -471,7 +475,7 @@ collect_bins(Fitting, Bins, Timeout, Uq, Ud, Result) ->
                         {false, Inputs}
                 end,
             %% error; requeue elsewhere
-            case queue_work_bin(Fitting, Leftover, Timeout, Used) of
+            case queue_work_bin(Fitting, {Hash, Leftover}, Timeout, Used) of
                 {ok, NewBin} ->
                     collect_bins(Fitting, [NewBin|Rest],
                                  Timeout, Uq, Ud, Result);
@@ -526,13 +530,14 @@ receive_bin(#fitting{ref=Ref}=Fitting, Bins) ->
                      riak_core_apl:preflist()) ->
         {ok, #bin{}} | {error, term()}.
 queue_work_bin(#fitting{nval=Nval}=Fitting,
-               [Head|_]=Inputs, Timeout, Used) ->
-    Remaining = remaining_preflist(
-                  Head, work_hash(Fitting, Head), Nval, Used),
+               {Hash, [Head|_]=Inputs}, Timeout, Used) ->
+    %% TODO: this assumes all of Inputs have the same N-value
+    Remaining = remaining_preflist(Head, Hash, Nval, Used),
     case queue_work_bin_send(Fitting, Inputs, Timeout, Used, Remaining) of
         {ok, VnodePid, NewUsed} ->
             MonRef = erlang:monitor(process, VnodePid),
             {ok, #bin{inputs=Inputs,
+                      hash=Hash,
                       vnode=VnodePid,
                       monitor=MonRef,
                       used=NewUsed}};
