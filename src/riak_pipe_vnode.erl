@@ -1250,7 +1250,7 @@ next_input_nohandoff(WorkerUnperf,
             send_input(Worker, Input),
             WorkingWorker = Worker#worker{state={working, Input},
                                           q=NewQ},
-            FinalWorker = maybe_unblock(queue:len(NewQ)-Worker#worker.q_limit,
+            FinalWorker = maybe_unblock(Worker#worker.q_limit-queue:len(NewQ),
                                         WorkingWorker, Partition);
         empty ->
             FinalWorker = maybe_done(Worker, Type, Partition)
@@ -1260,7 +1260,7 @@ next_input_nohandoff(WorkerUnperf,
 %% @doc Pull things out of the blocking queue if there is room in the
 %% input queue. First parameter is the maximum number of items to unblock.
 -spec maybe_unblock(non_neg_integer(), #worker{}, partition()) -> #worker{}.
-maybe_unblock(0, Worker, _Partition) ->
+maybe_unblock(L, Worker, _Partition) when L =< 0 ->
     Worker;
 maybe_unblock(L, #worker{q=Q, blocking=B, details=D}=Worker, Partition) ->
     case queue:out(B) of
@@ -1285,7 +1285,7 @@ maybe_unblock(L, #worker{q=Q, blocking=B, details=D}=Worker, Partition) ->
                 _ ->
                     %% still more items to queue for this request,
                     %% continue blocking
-                    StillB = queue:in_r({{Type, BlockInputs},
+                    StillB = queue:in_r({{Type, Rest},
                                          Blocker,
                                          BlockUsedPreflist},
                                         NewB),
