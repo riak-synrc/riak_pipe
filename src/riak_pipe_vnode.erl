@@ -129,7 +129,7 @@
 %% enqlist is enqueue, but for the queue_list function, which needs a
 %% different reply format to operate correctly
 -record(cmd_enqlist, {fitting :: #fitting{},
-                      inputs :: term(),
+                      inputs :: list(),
                       timeout :: qtimeout(),
                       usedpreflist :: riak_core_apl:preflist()}).
 -record(cmd_eoi, {fitting :: #fitting{}}).
